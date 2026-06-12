@@ -1,23 +1,10 @@
-"""
-API Gateway — Entry point.
-
-Responsibilities:
-  1. Authenticate requests via Bearer token (API key)
-  2. Enforce per-tenant rate limits (sliding window, Redis-backed)
-  3. Forward enriched requests to the Inference Gateway
-  4. Proxy the SSE token stream back to the original client
-
-All heavy lifting (queuing, tenant context injection, SSE management)
-is delegated to the Inference Gateway.
-"""
-
 import os
 import logging
 import asyncio
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Depends, Request, HTTPException
+from fastapi import FastAPI, Depends, Request
 from fastapi.responses import StreamingResponse
 from prometheus_client import make_asgi_app
 
@@ -50,46 +37,37 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Mount Prometheus metrics endpoint
 metrics_app = make_asgi_app()
 app.mount("/metrics", metrics_app)
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint for load balancer and monitoring."""
     return {"status": "healthy", "service": "api_gateway"}
 
 
 @app.post("/v1/chat")
 async def chat(
-    request: ChatRequest,
+    chat_request: ChatRequest,                          # ← renamed to chat_request
     tenant: TenantConfig = Depends(validate_api_key),
-    _rate_ok: None = Depends(check_rate_limit),
 ):
     """
     Main chat endpoint. Accepts a list of messages and streams back
     generated tokens as Server-Sent Events (SSE).
-
-    Headers required:
-        Authorization: Bearer <api_key>
-
-    Response:
-        Content-Type: text/event-stream
-        Each event: data: {"token": "..."}\n\n
-        Final event: data: [DONE]\n\n
     """
+    # Run rate limit check manually so it has access to tenant
+    await check_rate_limit(tenant)
+
     gateway_requests_total.labels(
         tenant_id=tenant.tenant_id, tier=tenant.tier
     ).inc()
 
-    # Build the internal request payload with tenant metadata attached
     internal_request = InternalInferRequest(
         tenant_id=tenant.tenant_id,
         tier=tenant.tier,
-        messages=request.messages,
-        max_tokens=request.max_tokens,
-        temperature=request.temperature,
+        messages=chat_request.messages,             # ← use chat_request
+        max_tokens=chat_request.max_tokens,         # ← use chat_request
+        temperature=chat_request.temperature,       # ← use chat_request
     )
 
     logger.info(
@@ -102,7 +80,7 @@ async def chat(
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",       # Disable Nginx buffering
+            "X-Accel-Buffering": "no",
             "X-Request-ID": internal_request.request_id,
         },
     )
@@ -111,7 +89,7 @@ async def chat(
 async def _proxy_sse_stream(internal_request: InternalInferRequest):
     """
     Async generator that forwards the SSE stream from the Inference Gateway
-    to the client. Handles connection errors gracefully.
+    to the client.
     """
     url = f"{INFERENCE_GATEWAY_URL}/v1/infer"
 
@@ -132,7 +110,6 @@ async def _proxy_sse_stream(internal_request: InternalInferRequest):
                     yield f"data: {{\"error\": \"Upstream error {response.status_code}\"}}\n\n"
                     return
 
-                # Forward each SSE chunk as-is to the client
                 async for chunk in response.aiter_text():
                     if chunk:
                         yield chunk
@@ -142,7 +119,6 @@ async def _proxy_sse_stream(internal_request: InternalInferRequest):
         yield 'data: {"error": "Inference service unavailable"}\n\n'
 
     except asyncio.CancelledError:
-        # Client disconnected — stop proxying silently
         logger.info(
             f"Client disconnected for request {internal_request.request_id}"
         )

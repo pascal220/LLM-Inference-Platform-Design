@@ -1,15 +1,3 @@
-"""
-Sliding window rate limiter backed by Redis.
-
-Uses two counters per tenant (current window + previous window) to
-implement a smooth sliding window algorithm without Lua scripts.
-
-Rate formula:
-    rate = prev_count * ((window - elapsed) / window) + curr_count
-
-If rate exceeds the tenant's limit, the request is rejected with HTTP 429.
-"""
-
 import time
 import logging
 from fastapi import HTTPException, status
@@ -20,36 +8,33 @@ from shared.metrics import rate_limit_hits
 
 logger = logging.getLogger(__name__)
 
-WINDOW_SECONDS = 1  # 1-second sliding window
+WINDOW_SECONDS = 1
 
 
-async def check_rate_limit(tenant: TenantConfig) -> None:
+async def check_rate_limit(tenant: TenantConfig) -> None:   # ← plain argument, not Depends
     """
-    FastAPI dependency (called after auth).
+    Checks the sliding window rate limit for the given tenant.
     Raises HTTP 429 if the tenant has exceeded their rate limit.
     """
     redis = await get_redis()
     now = time.time()
     window = WINDOW_SECONDS
 
-    # Keys for current and previous time windows
     current_window = int(now // window)
     previous_window = current_window - 1
 
     curr_key = f"rl:{tenant.tenant_id}:{current_window}"
     prev_key = f"rl:{tenant.tenant_id}:{previous_window}"
 
-    # Atomic pipeline: increment current window counter
     async with redis.pipeline(transaction=True) as pipe:
         pipe.incr(curr_key)
-        pipe.expire(curr_key, window * 2)  # keep for 2 windows
+        pipe.expire(curr_key, window * 2)
         pipe.get(prev_key)
         results = await pipe.execute()
 
     curr_count = int(results[0])
     prev_count = int(results[2]) if results[2] else 0
 
-    # Sliding window rate estimate
     elapsed_in_window = now % window
     rate = prev_count * ((window - elapsed_in_window) / window) + curr_count
 

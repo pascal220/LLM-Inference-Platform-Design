@@ -34,11 +34,11 @@ async def lifespan(app: FastAPI):
     redis = await get_redis()
     for queue in ["queue:premium", "queue:standard"]:
         try:
-            await redis.xgroup_create(queue, "workers", id="0", mkstream=True)
+            await redis.xgroup_create(queue, "workers", id="$", mkstream=True)
             logger.info(f"Created consumer group 'workers' on {queue}")
         except Exception:
             # Group already exists — safe to ignore
-            pass
+            logger.info(f"Consumer group 'workers' already exists on {queue}")
     yield
     logger.info("Inference Gateway shutting down...")
     await close_redis()

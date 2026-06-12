@@ -31,6 +31,19 @@ WORKER_ID = os.getenv("WORKER_ID", "worker-1")
 PENDING_RECLAIM_TIMEOUT_MS = 60_000  # 60 seconds
 POLL_BLOCK_MS = 1000  # Block for up to 1s waiting for new messages
 
+async def ensure_consumer_groups() -> None:
+    """
+    Ensures consumer groups exist on both queues.
+    Called on worker startup as a safety net in case the
+    Inference Gateway has not created them yet.
+    """
+    redis = await get_redis()
+    for queue in [QUEUE_PREMIUM, QUEUE_STANDARD]:
+        try:
+            await redis.xgroup_create(queue, CONSUMER_GROUP, id="$", mkstream=True)
+            logger.info(f"Worker created consumer group on {queue}")
+        except Exception:
+            logger.info(f"Consumer group already exists on {queue}")
 
 async def reclaim_stale_messages() -> None:
     """
@@ -70,9 +83,9 @@ async def poll_next_job() -> InternalInferRequest | None:
             results = await redis.xreadgroup(
                 groupname=CONSUMER_GROUP,
                 consumername=WORKER_ID,
-                streams={queue: ">"},  # ">" means only new, undelivered messages
+                streams={queue: ">"},
                 count=1,
-                block=POLL_BLOCK_MS if queue == QUEUE_STANDARD else 0,
+                block=POLL_BLOCK_MS,
             )
 
             if not results:
@@ -89,7 +102,6 @@ async def poll_next_job() -> InternalInferRequest | None:
 
             request = InternalInferRequest.model_validate_json(payload)
 
-            # Check TTL — discard expired requests
             if request.is_expired():
                 logger.warning(
                     f"Discarding expired request_id={request.request_id} "
@@ -99,10 +111,8 @@ async def poll_next_job() -> InternalInferRequest | None:
                 await redis.xack(queue, CONSUMER_GROUP, entry_id)
                 return None
 
-            # Store entry_id on the request object for ACKing after processing
-            # We use a simple attribute injection here
-            request._stream_entry_id = entry_id  # type: ignore[attr-defined]
-            request._stream_queue = queue  # type: ignore[attr-defined]
+            request._stream_entry_id = entry_id     # type: ignore[attr-defined]
+            request._stream_queue = queue           # type: ignore[attr-defined]
 
             logger.info(
                 f"Dequeued request_id={request.request_id} "
@@ -111,7 +121,7 @@ async def poll_next_job() -> InternalInferRequest | None:
             return request
 
         except Exception as e:
-            logger.error(f"Error polling {queue}: {e}")
+            logger.error(f"Error polling {queue}: {e}", exc_info=True)
             continue
 
     return None

@@ -30,7 +30,7 @@ from shared.metrics import (
 )
 
 from engine import create_engine
-from queue_consumer import poll_next_job, ack_job, reclaim_stale_messages
+from queue_consumer import poll_next_job, ack_job, reclaim_stale_messages, ensure_consumer_groups
 from publisher import publish_token, publish_error
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -52,7 +52,8 @@ async def inference_loop() -> None:
     """
     logger.info(f"Worker {WORKER_ID} inference loop started.")
 
-    # Reclaim any messages left pending by a previously crashed worker
+    # Ensure consumer groups exist (safety net). Reclaim any messages left pending by a previously crashed worker
+    await ensure_consumer_groups()  
     await reclaim_stale_messages()
 
     while True:
